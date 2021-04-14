@@ -1,0 +1,487 @@
+---
+title: "ptfe-bca-data-collection"
+author: "Anthony Morada"
+date: "2/11/2021"
+output: 
+  html_document: 
+    toc: yes
+    fig_width: 6.5
+    fig_height: 9
+    number_sections: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+# Set Up and Cleaning Data  
+```{r setup}
+library(readxl)
+library(dplyr)
+library(janitor)
+library(survival)
+library(survminer)
+library(tableone)
+library(finalfit)
+
+#For TableOne
+kableone <- function(x, ...) {
+  capture.output(x <- print(x))
+  knitr::kable(x, ...)
+}
+```
+
+```{r loading data}
+#Loading Data
+
+#From old file, we edited this to fill in OP variables
+# pt_list <- read_excel("~/THE GUTHRIE CLINIC/Vascular Surgery Quality Improvement and Research - General/Copy of AV Access Research Patient List 2013-2019.xlsx", sheet = "AV Access Pt List") %>%
+#   clean_names()
+
+pt_list <- read_excel("~/THE GUTHRIE CLINIC/Vascular Surgery Quality Improvement and Research - General/PTFE and BCA/copy_for_data_collection_20210211.xlsx", sheet = "Brachial AV Access") %>%
+  clean_names()
+
+thiry_day <- read_excel("~/THE GUTHRIE CLINIC/Vascular Surgery Quality Improvement and Research - General/Copy of AV Access Research Patient List 2013-2019.xlsx", sheet = "AV Access 30-day ") %>%
+  clean_names()
+
+long_term <- read_excel("~/THE GUTHRIE CLINIC/Vascular Surgery Quality Improvement and Research - General/2021 AV graft versus BCA.xlsx", sheet = "AV Access Long Term ")  %>%
+  clean_names()
+
+```
+
+```{r cleaning data}
+
+```
+
+# Patient Selection  
+
+```{r patient selection}
+df <- pt_list %>%
+  filter(access_type == "2" | access_type == "3"| access_type == "5"| access_type == "6")
+
+case_id <- unique(select(df, mrn, procedure_date))
+
+long_term <- filter(long_term, long_term$mrn %in% case_id$mrn)
+```
+
+# Variable Selection  
+## Dependent Variables  
+```{r choosing dependent variables}
+#dependent variables
+
+# Dialysis Use
+# Event = Used in dialysis by using "Date Index Access First Used"
+# Censored = Death, any intervention,everything else on follow up
+
+# Primary Patency 
+# Event = any intervention using "Date of Intervention == any date"
+# Censored = death, no first dialysis use, everything else on follow up
+
+#Primary Assisted Patency 
+# Event = INTI - Thrombosis = 1 & Date of Intervention == any date
+# Censored = death, no first dialysis use, everything else on follow up
+
+# Secondary Patency
+# Event = graft failure using "Date Index Access Abandoned == Date"
+# Cersured = death, no first dialysis use, everything else on follow up
+
+#infection 
+#Event = INTI - Infection & Date of Intervention == any date
+# Censored = death, no first dialysis use, everything else on follow up
+
+
+dep_vars <- c("primprocid", "dob", "mrn", "procedure_date", 
+  "date_of_contact", #Follow up
+  "ssdi_date_of_death", #Death
+  "date_access_first_used", #Dialysis Use
+  "date_of_intervention_1", #Primary Patency 
+  "inti_thrombosis_1", #Primary Assisted Patency
+  "date_index_access_abandoned", #Secondary Patency
+  "inti_infection_1", #Infection
+)
+
+dep_tbl <- select(long_term,all_of(dep_vars)) %>%
+  mutate(fu_d = as.numeric(date_of_contact-procedure_date)) %>%
+  mutate(death_d = as.numeric(ssdi_date_of_death-procedure_date)) %>%
+  mutate(death_s = case_when(!is.na(ssdi_date_of_death)~1,
+                             is.na(ssdi_date_of_death)~0)) %>%
+  mutate(firstuse_d = as.numeric(date_access_first_used-procedure_date)) %>%
+  mutate(firstuse_s = case_when(!is.na(firstuse_d)~1,
+                             is.na(firstuse_d)~0)) %>%
+  mutate(pp_d = as.numeric(date_of_intervention_1-procedure_date)) %>%
+  mutate(pp_s = case_when(!is.na(pp_d)~1,
+                             is.na(pp_d)~0)) %>%
+  mutate(pap_d = case_when(
+    inti_thrombosis_1 == 1 & !is.na(inti_thrombosis_1) ~ as.numeric(date_of_intervention_1-procedure_date), 
+    TRUE ~ NA_real_)) %>%
+  mutate(pap_s = case_when(!is.na(pap_d)~1,
+                          is.na(pap_d)~0)) %>%
+  mutate(sp_d = as.numeric(difftime(date_index_access_abandoned, procedure_date, units = "days"))) %>%
+  mutate(sp_s = case_when(!is.na(sp_d)~1,
+                          is.na(sp_d)~0)) %>%
+  mutate(inf_d = case_when(
+    inti_infection_1 == 1 & !is.na(inti_infection_1) ~ as.numeric(date_of_intervention_1-procedure_date), 
+    TRUE ~ NA_real_)) %>%
+  mutate(inf_s = case_when(!is.na(inf_d)~1,
+                           is.na(inf_d)~0)) 
+  
+
+survival_variables <- c("mrn", "procedure_date","fu_d", "death_d", "death_s", "firstuse_d", "firstuse_s", "inf_d", "inf_s", "pp_d","pp_s", "pap_d", "pap_s","sp_d","sp_s")
+surv_table <- select(dep_tbl, all_of(survival_variables))
+
+```
+
+```{r cleaning dependent variables}
+# START TEST AREA 
+test <- surv_table
+
+## EXTRA EXPERIMENT ZONE: HUGE ASSUMPTION IF THEY HAD THE PROCEDURE THEY HAD THE HD USED THEREFORE REMOVED FIRSTUSE
+test <- select(test, -firstuse_d, -firstuse_s)
+## END OF EXTRA EXPERIMENT ZONE
+
+#Making blank table for rbind lable
+case_outcomes = test[FALSE,]
+
+## Begin the looop here!!!
+for(i in 1:nrow(case_id)){
+  #looking at each case independently
+  id <- case_id$mrn[i]
+  dt <- case_id$procedure_date[i]
+  temp <- filter(test, test$mrn == id & test$procedure_date == dt)
+  temp <- temp[order(temp$fu_d, decreasing=TRUE),]
+  #death. Death is not censored by anything, if the death column is empty then latest followup will take its place.
+  if(is.na(temp$death_d[1])){temp$death_d <- temp$fu_d[1]}
+  #secondary patency. It is only censored by death. Therefore if this is empty, death or follow up duration should go here (whichever comes last) as these are censored.Because we already filled in death we can pull the death data to fill the duration for the censored secondary patency value.
+  if(is.na(temp$sp_d[1])){temp$sp_d <- temp$death_d[1]}
+  #primary assisted patency. PAP is censored by death and secondary patency (whichever comes first). Therefore if PAP is empty then it will be replaced by secondary patency duration and if secondary patency is negative then it will be death but if death is negative then it will be follow up.
+  if(is.na(temp$pap_d[1])){temp$pap_d <- temp$sp_d[1]}
+  #primary patency. PP is a subset of PAP, but it will follow the same censorship rules as PAP
+  if(is.na(temp$pp_d[1])){temp$pp_d <- temp$sp_d[1]}
+  #infection. infection is a subset of PAP and PP and it will follow the same censorship rules
+  if(is.na(temp$inf_d[1])){temp$inf_d <- temp$sp_d[1]}
+  case_outcomes <- rbind(tail(temp,1), case_outcomes)
+}
+
+### READY FOR MERGE
+df_dep <- case_outcomes
+
+```
+
+```{r plotting dependent variables}
+#Death
+ggsurvplot(
+    fit = survfit(Surv(death_d, death_s) ~ 1, data = case_outcomes), 
+    xlab = "Days", 
+    ylab = "Overall survival probability")
+
+#Secondary Patency
+ggsurvplot(
+    fit = survfit(Surv(sp_d, sp_s) ~ 1, data = case_outcomes), 
+    xlab = "Days", 
+    ylab = "Secondary Patency Free Survival")
+
+#Primary assisted Patency
+ggsurvplot(
+    fit = survfit(Surv(pap_d, pap_s) ~ 1, data = case_outcomes), 
+    xlab = "Days", 
+    ylab = "Primary Assisted Patency Free Survival")
+
+#Primary Partency
+ggsurvplot(
+    fit = survfit(Surv(pp_d, pp_s) ~ 1, data = case_outcomes), 
+    xlab = "Days", 
+    ylab = "Primary Patency Survival")
+```
+
+## Independent Variables
+```{r selecting and cleaning independent variables}
+#selecting independent variables
+ind_vars <- c("mrn", "procedure_date", "dob", "gender", "race", "hispanic_or_latino", "height_cm", "weight_kg", "living_status", "functional_status", "cad", "chf", "ejection_fraction", "dysrhythmia", "prior_cabg", "prior_pci", "prior_pci", "copd", "diabetes", "hypertension","smoking", "iv_drug_use", "preop_hemoglobin", "esrd", "creatinine", "gfr_e_gfr", "ckd_stage", "asa", "antiplatelet_drugs","statin","chronic_anticoagulant", "s_ptfe_bca", "s_loop_str","s_inflow_artery","s_outflow_vein","size_mm")
+
+#cleaning independent variables
+df_ind <- select(df,all_of(ind_vars)) %>%
+  mutate(mrn=as.character(mrn)) %>%
+  mutate(age = as.numeric(difftime(procedure_date, dob, units = "days"))/365.25) %>%
+  mutate(gender=as.factor(gender)) %>%
+  mutate(race=as.factor(race)) %>%
+  mutate(hispanic_or_latino=as.factor(hispanic_or_latino)) %>%
+  mutate(living_status=as.factor(living_status)) %>%
+  mutate(functional_status=as.factor(functional_status)) %>%
+  mutate(cad=as.factor(cad)) %>%
+  mutate(chf=as.factor(chf)) %>%
+  mutate(dysrhythmia=as.factor(dysrhythmia)) %>%
+  mutate(prior_cabg=as.factor(prior_cabg)) %>%
+  mutate(prior_pci=as.factor(prior_pci)) %>%
+  mutate(copd=as.factor(copd)) %>%
+  mutate(diabetes=as.factor(diabetes)) %>%
+  mutate(hypertension=as.factor(hypertension)) %>%
+  mutate(smoking=as.factor(smoking)) %>%
+  mutate(iv_drug_use=as.factor(iv_drug_use)) %>%
+  mutate(esrd=as.factor(esrd)) %>%
+  mutate(ckd_stage=as.factor(ckd_stage)) %>%
+  mutate(antiplatelet_drugs=as.factor(antiplatelet_drugs)) %>%
+  mutate(statin=as.factor(statin)) %>%
+  mutate(s_ptfe_bca=as.factor(s_ptfe_bca)) %>%
+  mutate(s_loop_str=as.factor(s_loop_str)) %>%
+  mutate(s_inflow_artery = gsub("brachial artery", "brachial", s_inflow_artery)) %>%
+  mutate(s_inflow_artery=as.factor(s_inflow_artery)) %>%
+  mutate(s_outflow_vein=as.factor(s_outflow_vein)) %>%
+  mutate(size_mm = gsub("\\?", NA, size_mm)) %>%
+  mutate(size_mm=as.factor(size_mm)) 
+
+
+
+
+```
+
+# Combining Dependent and Independent Variables  
+```{r combine vars}
+df <- inner_join(df_dep, df_ind, by = c("mrn", "procedure_date"))
+
+
+#updating dependent and independent variables
+#updating independent variables
+ind_vars <- c("gender","age","race", "hispanic_or_latino", "height_cm", "weight_kg", "living_status", "functional_status", "cad", "chf", "ejection_fraction", "dysrhythmia", "prior_cabg", "prior_pci", "prior_pci", "copd", "diabetes", "hypertension","smoking", "iv_drug_use", "preop_hemoglobin", "esrd", "creatinine", "gfr_e_gfr", "ckd_stage", "asa", "antiplatelet_drugs","statin","chronic_anticoagulant", "s_ptfe_bca", "s_loop_str", "s_inflow_artery", "s_outflow_vein", "size_mm")
+
+#updating dependent variables
+dep_vars <- c("death_d", "death_s", "firstuse_d", "firstuse_s", "inf_d", "inf_s", "pp_d","pp_s", "pap_d", "pap_s","sp_d","sp_s")
+
+```
+
+
+# Data Analysis  
+## Summary of Variables  
+```{r summary of variables}
+#independent vars table
+print("Summary of Independent Variables")
+kableone(print(
+  CreateTableOne(vars = ind_vars, data = df), 
+  showAllLevels = TRUE,
+  missing = TRUE,
+  noSpaces = TRUE
+  ))
+
+#dependent vars
+print("Summary of Dependent Variables")
+kableone(print(
+  CreateTableOne(vars = dep_vars, data = df), 
+  showAllLevels = TRUE,
+  missing = TRUE,
+  noSpaces = TRUE
+  ))
+
+```
+
+
+## Checking Variables and Cleaning Variables
+```{r check and clean variables for analysis}
+ff_glimpse(df)
+
+# Removing variables with only one factor
+cat_vars <- sapply(df, is.factor) #finding categorical variables
+remove_cat <- sapply(df[,cat_vars], nlevels) == 1 #finding categorical variables with only 1 level
+remove_cat <- remove_cat[remove_cat == TRUE]
+remove_cat <- names(remove_cat) # getting names of cats to remove
+ind_vars <- ind_vars[!ind_vars %in% remove_cat]
+
+#Removed Variables due to 1 level
+print(remove_cat)
+
+
+# Removing variables with only NA variables
+remove_var <- colSums(is.na(df)) >= nrow(df)*0.5
+remove_var <- remove_var[remove_var == TRUE]
+remove_var <- names(remove_var)
+ind_vars <- ind_vars[!ind_vars %in% remove_var]
+
+#Removed Variables due to 50% NA
+print(remove_var)
+```
+
+
+
+## PTFE vs BCA  
+
+```{r PTFE vs BCA, fig.height=9, fig.width=6.5}
+explanatory = ind_vars[ind_vars!="s_ptfe_bca"]
+dependent = "s_ptfe_bca"
+df %>%
+  summary_factorlist(dependent, explanatory, p = TRUE, p_cont_para = "t.test") -> t
+
+kableone(t)
+
+
+
+## SURVIVAL
+ggsurvplot(
+   survfit(Surv(death_d, death_s) ~ s_ptfe_bca, data = df), # survfit object with calculated statistics.
+   pval = TRUE,             # show p-value of log-rank test.
+   conf.int = TRUE,         # show confidence intervals for 
+                            # point estimaes of survival curves.
+   conf.int.style = "step",  # customize style of confidence intervals
+   xlab = "Time in days",   # customize X axis label.
+   break.time.by = 200,     # break X axis in time intervals by 200.
+   ggtheme = theme_light(), # customize plot and risk table with a theme.
+   risk.table = "abs_pct",  # absolute number and percentage at risk.
+  risk.table.y.text.col = T,# colour risk table text annotations.
+  risk.table.y.text = FALSE,# show bars instead of names in text annotations
+                            # in legend of risk table.
+  ncensor.plot = TRUE,      # plot the number of censored subjects at time t
+  surv.median.line = "hv",  # add the median survival pointer.
+  palette = 
+    c("#E7B800", "#2E9FDF") # custom color palettes.
+)
+
+#1 Year 
+summary(survfit(Surv(death_d, death_s) ~ s_ptfe_bca, data = df), times = 365.25)
+
+# Median 
+survfit(Surv(death_d, death_s) ~ s_ptfe_bca, data = df)
+
+#Cox
+f <- as.formula(
+    paste("Surv(death_d, death_s)", paste(ind_vars, collapse = " + "),sep = " ~ ")
+)
+
+coxph(formula = f, data = df) %>% 
+  gtsummary::tbl_regression(exp = TRUE) 
+
+
+## PRIMARY PATENCY
+ggsurvplot(
+   survfit(Surv(pp_d, pp_s) ~ s_ptfe_bca, data = df), # survfit object with calculated statistics.
+   pval = TRUE,             # show p-value of log-rank test.
+   conf.int = TRUE,         # show confidence intervals for 
+                            # point estimaes of survival curves.
+   conf.int.style = "step",  # customize style of confidence intervals
+   xlab = "Time in days",   # customize X axis label.
+   break.time.by = 200,     # break X axis in time intervals by 200.
+   ggtheme = theme_light(), # customize plot and risk table with a theme.
+   risk.table = "abs_pct",  # absolute number and percentage at risk.
+  risk.table.y.text.col = T,# colour risk table text annotations.
+  risk.table.y.text = FALSE,# show bars instead of names in text annotations
+                            # in legend of risk table.
+  ncensor.plot = TRUE,      # plot the number of censored subjects at time t
+  surv.median.line = "hv",  # add the median survival pointer.
+  palette = 
+    c("#E7B800", "#2E9FDF") # custom color palettes.
+)
+#1 Year 
+summary(survfit(Surv(pp_d, pp_s) ~ s_ptfe_bca, data = df), times = 365.25)
+
+# Median 
+survfit(Surv(pp_d, pp_s) ~ s_ptfe_bca, data = df)
+
+#Cox
+f <- as.formula(
+    paste("Surv(pp_d, pp_s)", paste(ind_vars, collapse = " + "),sep = " ~ ")
+)
+
+coxph(formula = f, data = df) %>% 
+  gtsummary::tbl_regression(exp = TRUE) 
+
+
+
+
+
+## PRIMARY ASSISTED PATENCY
+ggsurvplot(
+   survfit(Surv(pap_d, pap_s) ~ s_ptfe_bca, data = df), # survfit object with calculated statistics.
+   pval = TRUE,             # show p-value of log-rank test.
+   conf.int = TRUE,         # show confidence intervals for 
+                            # point estimaes of survival curves.
+   conf.int.style = "step",  # customize style of confidence intervals
+   xlab = "Time in days",   # customize X axis label.
+   break.time.by = 200,     # break X axis in time intervals by 200.
+   ggtheme = theme_light(), # customize plot and risk table with a theme.
+   risk.table = "abs_pct",  # absolute number and percentage at risk.
+  risk.table.y.text.col = T,# colour risk table text annotations.
+  risk.table.y.text = FALSE,# show bars instead of names in text annotations
+                            # in legend of risk table.
+  ncensor.plot = TRUE,      # plot the number of censored subjects at time t
+  surv.median.line = "hv",  # add the median survival pointer.
+  palette = 
+    c("#E7B800", "#2E9FDF") # custom color palettes.
+)
+#1 Year 
+summary(survfit(Surv(pap_d, pap_s) ~ s_ptfe_bca, data = df), times = 365.25)
+
+# Median 
+survfit(Surv(pap_d, pap_s) ~ s_ptfe_bca, data = df)
+
+#Cox
+f <- as.formula(
+    paste("Surv(pap_d, pap_s)", paste(ind_vars, collapse = " + "),sep = " ~ ")
+)
+
+coxph(formula = f, data = df) %>% 
+  gtsummary::tbl_regression(exp = TRUE) 
+
+
+
+## SECONDARY PATENCY
+ggsurvplot(
+   survfit(Surv(sp_d, sp_s) ~ s_ptfe_bca, data = df), # survfit object with calculated statistics.
+   pval = TRUE,             # show p-value of log-rank test.
+   conf.int = TRUE,         # show confidence intervals for 
+                            # point estimaes of survival curves.
+   conf.int.style = "step",  # customize style of confidence intervals
+   xlab = "Time in days",   # customize X axis label.
+   break.time.by = 200,     # break X axis in time intervals by 200.
+   ggtheme = theme_light(), # customize plot and risk table with a theme.
+   risk.table = "abs_pct",  # absolute number and percentage at risk.
+  risk.table.y.text.col = T,# colour risk table text annotations.
+  risk.table.y.text = FALSE,# show bars instead of names in text annotations
+                            # in legend of risk table.
+  ncensor.plot = TRUE,      # plot the number of censored subjects at time t
+  surv.median.line = "hv",  # add the median survival pointer.
+  palette = 
+    c("#E7B800", "#2E9FDF") # custom color palettes.
+)
+#1 Year 
+summary(survfit(Surv(sp_d, sp_s) ~ s_ptfe_bca, data = df), times = 365.25)
+
+# Median 
+survfit(Surv(sp_d, sp_s) ~ s_ptfe_bca, data = df)
+
+#Cox
+f <- as.formula(
+    paste("Surv(sp_d, sp_s)", paste(ind_vars, collapse = " + "),sep = " ~ ")
+)
+
+coxph(formula = f, data = df) %>% 
+  gtsummary::tbl_regression(exp = TRUE) 
+
+
+## INFECTION
+ggsurvplot(
+   survfit(Surv(inf_d, inf_s) ~ s_ptfe_bca, data = df), # survfit object with calculated statistics.
+   pval = TRUE,             # show p-value of log-rank test.
+   conf.int = TRUE,         # show confidence intervals for 
+                            # point estimaes of survival curves.
+   conf.int.style = "step",  # customize style of confidence intervals
+   xlab = "Time in days",   # customize X axis label.
+   break.time.by = 200,     # break X axis in time intervals by 200.
+   ggtheme = theme_light(), # customize plot and risk table with a theme.
+   risk.table = "abs_pct",  # absolute number and percentage at risk.
+  risk.table.y.text.col = T,# colour risk table text annotations.
+  risk.table.y.text = FALSE,# show bars instead of names in text annotations
+                            # in legend of risk table.
+  ncensor.plot = TRUE,      # plot the number of censored subjects at time t
+  surv.median.line = "hv",  # add the median survival pointer.
+  palette = 
+    c("#E7B800", "#2E9FDF") # custom color palettes.
+)
+#1 Year 
+summary(survfit(Surv(inf_d, inf_s) ~ s_ptfe_bca, data = df), times = 365.25)
+
+# Median 
+survfit(Surv(inf_d, inf_s) ~ s_ptfe_bca, data = df)
+
+#Cox
+f <- as.formula(
+    paste("Surv(inf_d, inf_s)", paste(ind_vars, collapse = " + "),sep = " ~ ")
+)
+
+coxph(formula = f, data = df) %>% 
+  gtsummary::tbl_regression(exp = TRUE) 
+```
+
