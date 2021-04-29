@@ -1,0 +1,45 @@
+---
+title: "bca.ptfe"
+output: html_notebook
+---
+
+Notebook for BCA vs PTFE study. 
+
+```{r setup}
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(reshape2)
+```
+
+
+```{r loading data}
+case_tbl <- read_excel("~/THE GUTHRIE CLINIC/Vascular Surgery Quality Improvement and Research - PTFE and BCA/copy_for_data_collection_20210217.xlsx", sheet = "AV Access Pt List") %>%
+  mutate(s_ptfe_bca = gsub("pfte", "ptfe", s_ptfe_bca)) %>% #cleaning s_ptfe_bca table
+  filter(s_ptfe_bca == "ptfe"| s_ptfe_bca == "bca") #filtering to only include ptfe and bca cases 
+
+mrn <- unique(case_tbl$MRN) #all pts with fistula graft 
+
+event_tbl <-  read_excel("~/THE GUTHRIE CLINIC/Vascular Surgery Quality Improvement and Research - PTFE and BCA/copy_for_data_collection_20210217.xlsx", sheet = "AV Access Long Term ") %>%
+  mutate(MRN = as.numeric(MRN)) %>%
+  filter(event_tbl$MRN %in% mrn) #filtering event_tbl for patients found in case_tbl
+
+event_tbl <- event_tbl[,1:226] #removing duplicate and excess columns
+```
+
+There are `r nrow(case_tbl)` fistula graft cases recorded in the database with `r length(unique(case_tbl$MRN))` unique patients. There are `r nrow(event_tbl)` follow events recorded that correspond to the patients with the fistula grafts. 
+
+
+```{r writing excel}
+require("xlsx")
+
+write.xlsx(x = case_tbl,
+           file = "bca_ptfe_df.xlsx",      
+           sheetName = "case_tbl")
+
+write.xlsx(x = event_tbl,
+           file = "bca_ptfe_df.xlsx",      
+           sheetName = "event_tbl",
+           append = TRUE)
+
+```
